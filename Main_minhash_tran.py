@@ -956,9 +956,10 @@ def train_trajectory(model, l=None, p=None):
 
 
 def evaluate_episode_rtg(
-        # env,
+        # env,  
+		state,   #  kafeng   probs_action,  replace env
         state_dim,
-        act_dim,
+        act_dim,   # kafeng batch_size  32
         model,
         # max_ep_len=1000,
 		max_ep_len=40,  #  kafeng  operators
@@ -968,6 +969,7 @@ def evaluate_episode_rtg(
         device='cuda',
         target_return=None,
         mode='normal',
+		return_traj=False,   # kafeng for replay buffer trajectory/feature    
     ):
 
     model.eval()
@@ -982,7 +984,8 @@ def evaluate_episode_rtg(
 
     # we keep all the histories on the device
     # note that the latest action and reward will be "padding"
-    states = torch.from_numpy(state).reshape(1, state_dim).to(device=device, dtype=torch.float32)
+    # states = torch.from_numpy(state).reshape(1, state_dim).to(device=device, dtype=torch.float32)   # kafeng modify
+    states = state.reshape(state_dim, state_dim).to(device=device, dtype=torch.float32)
     actions = torch.zeros((0, act_dim), device=device, dtype=torch.float32)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
 
@@ -995,11 +998,13 @@ def evaluate_episode_rtg(
     episode_return, episode_length = 0, 0
     for t in range(max_ep_len):
 
+       
         # add padding
         actions = torch.cat([actions, torch.zeros((1, act_dim), device=device)], dim=0)
         rewards = torch.cat([rewards, torch.zeros(1, device=device)])
-
-        action = model.get_action(
+	
+        '''  # kafeng   modify
+        action = model.get_action(          
             (states.to(dtype=torch.float32) - state_mean) / state_std,
             actions.to(dtype=torch.float32),
             rewards.to(dtype=torch.float32),
@@ -1030,30 +1035,47 @@ def evaluate_episode_rtg(
 
         if done:
             break
+		'''
+	
+		# error ???? shape ???
+        # state_preds, action_preds, reward_preds = model.forward(
+		# 	# states, actions, rewards, masks=None, attention_mask=attention_mask, target_return=returns,
+		# 	states, actions, rewards, rewards, timesteps,
+		# )
 
-    return episode_return, episode_length
+    if return_traj:			# kafeng  trajectory/feature  replay buffer 
+        traj = {
+			'observations': states[:-1].cpu().detach().numpy(),
+			'actions': actions.cpu().detach().numpy(), 
+			'rewards': rewards.cpu().detach().numpy(),
+			'terminals': np.zeros(episode_length, dtype=bool)
+		}
+        feature = []
+        return episode_return, episode_length, traj, feature
+    else:
+	    return episode_return, episode_length
 
 
-def eval_episodes(target_rew):
-		def fn(model):
-			returns, lengths = [], []
-			for _ in range(100):   # num_eval_episodes
-				with torch.no_grad():
-					ret, length = evaluate_episode_rtg(
-						# env, 
-						40, 40, model,
-						max_ep_len=40, scale=100, target_return=target_rew/100,
-						# mode=mode, state_mean=state_mean, state_std=state_std, device=device,
-					)
-				returns.append(ret)
-				lengths.append(length)
-			return {
-                f'target_{target_rew}_return_mean': np.mean(returns),
-                f'target_{target_rew}_return_std': np.std(returns),
-                f'target_{target_rew}_length_mean': np.mean(lengths),
-                f'target_{target_rew}_length_std': np.std(lengths),
-            }
-		return fn
+# def eval_episodes(target_rew):   # kafeng target_rew ??
+# 		def fn(model):
+# 			returns, lengths = [], []
+# 			for _ in range(100):   # num_eval_episodes
+# 				with torch.no_grad():
+# 					ret, length = evaluate_episode_rtg(
+# 						# env, 
+# 						40, 40, model,
+# 						max_ep_len=40, scale=100, target_return=target_rew/100,
+# 						# mode=mode, state_mean=state_mean, state_std=state_std, device=device,
+# 					)
+# 				returns.append(ret)
+# 				lengths.append(length)
+# 			return {
+#                 f'target_{target_rew}_return_mean': np.mean(returns),
+#                 f'target_{target_rew}_return_std': np.std(returns),
+#                 f'target_{target_rew}_length_mean': np.mean(lengths),
+#                 f'target_{target_rew}_length_std': np.std(lengths),
+#             }
+# 		return fn
 
 
 
@@ -1075,7 +1097,32 @@ def train_dt(model, l=None, p=None):   # kafeng modify from  DT  trainer.py/Trai
 	scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda steps: min((steps+1)/10000, 1))
 	batch_size = 32
 	# loss_fn = lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2)   # kafeng from experiment.py
-	loss_fn = lambda  a_hat,   a : torch.mean((a_hat - a)**2)  
+	# loss_fn = lambda  a_hat,   a : torch.mean((a_hat - a)**2)
+
+	# kafeng for entropy  loss
+	# Setup variable and optimizer for (log of) lagrangian multiplier used for entropy constraint
+	# We optimize the log of the multiplier b/c lambda >= 0
+	# log_entropy_multiplier = torch.zeros(1, requires_grad=True, device=device)  # kafeng modify  no use  gpu
+	log_entropy_multiplier = torch.zeros(1, requires_grad=True)
+	multiplier_optimizer = torch.optim.AdamW(
+		[log_entropy_multiplier],
+		lr=1e-4,
+		weight_decay=1e-4,
+	)
+	# multiplier_optimizer = torch.optim.Adam(
+	#     [log_entropy_multiplier],
+	#     lr=1e-3
+	#     #lr=variant['learning_rate'],
+	# )
+	multiplier_scheduler = torch.optim.lr_scheduler.LambdaLR(
+		multiplier_optimizer,
+		lambda steps: min((steps+1)/10000, 1)
+	)
+	# log_entropy_multiplier = torch.zeros(1, requires_grad=True, device=device)
+	# entropy_loss_fn = None  # kafeng add for 
+	loss_fn = lambda s_hat, a_hat, rtg_hat,r_hat, s, a, rtg, r, a_log_prob, entropies: -torch.mean(a_log_prob) - torch.exp(log_entropy_multiplier.detach()) * torch.mean(entropies)    # kafeng  error  ??
+	target_entropy = -32   # -act_dim =  -32 
+	entropy_loss_fn = lambda entropies: torch.exp(log_entropy_multiplier) * (torch.mean(entropies.detach()) - target_entropy)
 
 
 	# if env_name == 'hopper':
@@ -1089,6 +1136,7 @@ def train_dt(model, l=None, p=None):   # kafeng modify from  DT  trainer.py/Trai
 	# eval_fns = [eval_episodes(tar) for tar in env_targets]          #   num_eval_episodes   100   
 
 	train_losses = []
+	entropy_losses = []
 
 	for epoch_count in range(args.epochs):
 		concat_action = []
@@ -1162,9 +1210,13 @@ def train_dt(model, l=None, p=None):   # kafeng modify from  DT  trainer.py/Trai
 		
 		state_target, action_target, reward_target = torch.clone(states), torch.clone(actions), torch.clone(rewards)
 
-		state_preds, action_preds, reward_preds = model.forward(
-			# states, actions, rewards, masks=None, attention_mask=attention_mask, target_return=returns,
-			states, actions, rewards, returns, timesteps,
+		# state_preds, action_preds, reward_preds = model.forward(
+		# 	states, actions, rewards, returns, timesteps,
+		# )
+
+		state_preds, action_preds, reward_preds, action_log_probs, entropies  = model.forward(
+			# states, actions, rewards, returns, timesteps, attention_mask=None, target_actions=action_target
+			states, actions, rewards, returns, timesteps, attention_mask=None, target_actions=action_target.permute(1, 0).repeat(40, 1, 1)
 		)
 		# print('state_preds.shape = ', state_preds.shape)
 		# print('action_preds.shape = ', action_preds.shape)   # [40, 40, 32]
@@ -1187,24 +1239,65 @@ def train_dt(model, l=None, p=None):   # kafeng modify from  DT  trainer.py/Trai
 		# 	# state_target[:,1:], action_target, reward_target[:,1:],   # kafeng modify 
 		# 	state_target[:,1:], action_target_ex, reward_target[:,1:],
 		# )
-		loss = loss_fn(action_preds, action_target_ex)
+		# loss = loss_fn(action_preds, action_target_ex)
+		loss = loss_fn(
+            state_preds, action_preds, reward_preds, None,
+            # state_target, action_target, reward_target, None,
+			state_target, action_target, action_target_ex, None,
+            action_log_probs, entropies
+        )         # kafeng  this loss   backward   error   ?
 		optimizer.zero_grad()
+		# loss = loss.requires_grad_()  # add for new loss_fun
 		loss.backward()   # kafeng why run epoch > 1 error ??  retain_graph
 		optimizer.step()
+
+
+		 # Entropy multiplier tuning
+		if log_entropy_multiplier is not None:
+			entropy_multiplier_loss = entropy_loss_fn(entropies)
+			multiplier_optimizer.zero_grad()
+			entropy_multiplier_loss.backward()
+			multiplier_optimizer.step()
+			
+			entropy_loss = entropy_multiplier_loss.detach().cpu().item()
+		else:
+			entropy_loss = None
+	    
+		if entropy_loss is not None:
+				entropy_losses.append(entropy_loss)  
 
 		train_loss = loss.detach().cpu().item()
 
 		train_losses.append(train_loss)
 		if scheduler is not None:
 			scheduler.step()
-
+		if multiplier_scheduler is not None:    #  kafeng for entropy_losses
+			multiplier_scheduler.step()
 
 		model.eval()
-		# eval_episodes()
+		# eval_fns = eval_episodes()   # kafeng  ???? use this 
 		# for eval_fn in eval_fns:
 			# outputs = eval_fn(model)
 			# for k, v in outputs.items():
 			# 	logs[f'evaluation/{k}'] = v
+		# from eval_episodes
+		
+		target_rew = 1000  # kafeng add
+		returns, lengths, trajectorys, features = [], [], [], []
+		for _ in range(100):   # num_eval_episodes
+			with torch.no_grad():   # kafeng modify
+				ret, length, traj, feature = evaluate_episode_rtg(
+					# env, 
+					probs_action,   # kafeng replace env
+					40, 32, model,
+					max_ep_len=40, scale=100, target_return=target_rew/100,
+					# mode=mode, state_mean=state_mean, state_std=state_std, device=device,
+					return_traj=True,
+				)
+		returns.append(ret)
+		lengths.append(length)
+		trajectorys.append(traj)
+		features.append(feature)
 
 		
 		# test
