@@ -1,8 +1,9 @@
 # E-AFE-DT
+E-AFE-DT is E-AFE improvement. Replace RNN-based agent with Decision Transformer-based agent.
+The environment is PyTorch.
 
 https://github.com/wangkafeng/E-AFE
-
-This is E-AFE improvement. Replace RNN-based agent with Decision Transformer-based agent.
+The environment is Tensorflow.
 
 Decision Transformer reference :
 
