@@ -7,6 +7,11 @@ import torch.nn as nn
 # from keras.models import Sequential
 # from keras.layers import Dense, Activation
 # from keras import optimizers, regularizers
+
+from torch.distributions import Normal, Independent
+from torch.distributions.transformed_distribution import TransformedDistribution
+# from torch.distributions.transforms import TanhTransform
+
 import transformers   # for DT
 from trajectory_gpt2 import GPT2Model  # for DT
 import warnings
@@ -627,6 +632,14 @@ class Controller_dt(nn.Module):   #  for  optimizer parameters      decision tra
 		self.act_dim = act_dim
 		self.max_length = max_length
 
+		# from ODT
+		# Settings from stochastic actions
+		self.stochastic = True
+		self.log_std_min=-20
+		self.log_std_max=2
+		self.stochastic_tanh=False
+		self.approximate_entropy_samples=1000
+
 
 		self.hidden_size = hidden_size
 		config = transformers.GPT2Config(
@@ -652,11 +665,27 @@ class Controller_dt(nn.Module):   #  for  optimizer parameters      decision tra
 		self.predict_action = nn.Sequential(
             *([nn.Linear(hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
         )
+		# self.predict_return = torch.nn.Linear(hidden_size, 1)
+
+
+		if self.stochastic:   # kafeng  True
+			self.predict_action_mean = nn.Sequential(
+				nn.Linear(hidden_size, self.act_dim),       #  [40, 32]
+				# nn.Linear(hidden_size, self.state_dim),     # [40, 40]  kafeng input state_reps  ??
+			)
+			self.predict_action_logstd = nn.Sequential(
+				nn.Linear(hidden_size, self.act_dim),     #  [40, 32]
+				# nn.Linear(hidden_size, self.state_dim),     #  [40, 40]   kafeng input state_reps   ??
+			)
+		else:
+			self.predict_action = nn.Sequential(
+				*([nn.Linear(hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
+			)
 		self.predict_return = torch.nn.Linear(hidden_size, 1)
 
 
 	# def forward(self, states, actions, rewards, masks=None, attention_mask=None):    #  TrajectoryModel   (self, states, actions, rewards, masks=None, attention_mask=None):
-	def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask=None):    # from  DT
+	def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask, target_actions,  use_means=False):    # from  DT
 		print('states.shape = ', states.shape)
 		print('actions.shape = ', actions.shape)
 		print('returns_to_go.shape = ', returns_to_go.shape)
@@ -737,7 +766,68 @@ class Controller_dt(nn.Module):   #  for  optimizer parameters      decision tra
 		# # print('probs_action = ', probs_action)
 		# print('probs_action.shape = ', probs_action.shape)
 
-		return state_preds, action_preds, return_preds
+		# return state_preds, action_preds, return_preds
+
+		state_reps = x[:,1]   # kafeng modify
+		# state_reps = x[:,2]
+		action_reps = x[:,2] 
+
+		action_log_probs = None
+		entropies = None
+		if self.stochastic:
+            
+			means = self.predict_action_mean(state_reps)
+			print('means.shape = ', means.shape)    # [40, 40, 32]
+			log_stds = self.predict_action_logstd(state_reps)
+			print('log_stds.shape = ', log_stds.shape)   #  [40, 40, 32]
+
+			# Bound log of standard deviations
+			log_stds = torch.clamp(log_stds, self.log_std_min, self.log_std_max)
+			stds = torch.exp(log_stds)
+
+			#action_distributions = TransformedDistribution(Normal(means, stds), TanhTransform(cache_size=1))
+			#action_distributions = Normal(means, stds)
+
+			if self.stochastic_tanh:   # False
+				action_distributions = Independent(TransformedDistribution(Normal(means, stds), TanhTransform(cache_size=1)),1)
+			else:
+				action_distributions = Independent(Normal(means, stds),1)   #  kafeng  run this
+            # Sample from distribution or predict mean
+			if use_means:   # False
+				if self.stochastic_tanh:
+					action_preds = torch.tanh(action_distributions.base_dist.base_dist.mean)
+				else:
+					action_preds = action_distributions.mean
+			else:
+				action_preds = action_distributions.rsample()    #  kafeng  run this
+
+			# print('target_actions = ', target_actions)
+			print('target_actions.shape = ', target_actions.shape)     #  [32, 40] -> 
+			# if target_actions != None:
+			if target_actions is not None:   # kafeng run this 
+				# Clamp target actions to prevent nans
+				eps = torch.finfo(target_actions.dtype).eps
+				target_actions = torch.clamp(target_actions, -1+eps, 1-eps)
+				print('action_distributions = ', action_distributions)
+				# print('action_distributions.shape = ', action_distributions.shape)    #  'Independent' object has no attribute 'shape'
+				action_log_probs = action_distributions.log_prob(target_actions)   # kafeng  ???
+				#entropies = action_distributions.base_dist.entropy()
+				if self.stochastic_tanh:
+					entropies = -action_distributions.log_prob(action_distributions.rsample(sample_shape=torch.Size([self.approximate_entropy_samples]))).mean(dim=0)
+				else:
+					entropies = action_distributions.entropy()
+                
+
+		else:
+			action_preds = self.predict_action(x[:,1])  # predict next action given state
+
+		# kafeng add rand out
+		# action_log_probs = torch.rand([self.num_batch, self.num_action])
+		# entropies = torch.rand([self.num_batch, self.num_action])
+		print('action_log_probs = ', action_log_probs)
+		print('entropies = ', entropies)
+		return state_preds, action_preds, return_preds, action_log_probs, entropies
+
 
 
 
