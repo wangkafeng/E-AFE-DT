@@ -15,5 +15,5 @@ https://github.com/daniellawson9999/online-decision-transformer
 
 E-AFE-DT run with Decision Transformer agent:  --controller dt
 
-# python Main_minhash_tran.py --multiprocessing True --epochs 1 --dataset PimaIndian --minhash False --controller trajectory
-python Main_minhash_tran.py --multiprocessing True --epochs 1 --dataset PimaIndian --minhash False --controller dt
+# python Main_minhash_tran.py --multiprocessing False --epochs 1 --dataset PimaIndian --minhash True --controller trajectory
+python Main_minhash_tran.py --multiprocessing False --epochs 1 --dataset PimaIndian --minhash True --controller dt
