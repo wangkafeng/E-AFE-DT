@@ -5,6 +5,12 @@ The environment is PyTorch.
 https://github.com/wangkafeng/E-AFE
 The environment is Tensorflow.
 
+The E-AFE paper information is as follows.
+Toward Efficient Automated Feature Engineering
+2023 IEEE 39th International Conference on Data Engineering (ICDE)
+https://ieeexplore.ieee.org/document/10184603
+
+
 Decision Transformer reference :
 
 https://github.com/kzl/decision-transformer 
